@@ -1,0 +1,45 @@
+# Nav2 service wrapper for the Ranger Mini stack.
+#
+# Wraps `nav2_bringup` (system-installed via apt: `ros-humble-nav2-bringup`).
+# We don't vendor the nav2 source — it's huge and the upstream apt
+# package builds and ships it cleanly on the Jetson. We vendor only
+# the YAML param files in config/, copied from the robot's working
+# setup so DWB / costmap tunings carry over.
+#
+# Owns the `robonix/service/navigation/*` namespace.
+#
+# Lifecycle: start.sh launches the atlas bridge ONLY (no nav2 spawn).
+# `rbnx boot` then calls `Driver(CMD_INIT, config_json)` — the handler
+# spawns `ros2 launch nav2_bringup navigation_launch.py params_file:=…`,
+# waits for the `navigate_to_pose` action server to come up, then
+# declares navigate / status / cancel on atlas.
+#
+# Capability surface (mode = abstract pattern, transport = wire):
+#   service/navigation/driver    mode=rpc  transport=gRPC  Driver(INIT)
+#   service/navigation/navigate  mode=rpc  transport=gRPC  Navigate(PoseStamped)
+#   service/navigation/status    mode=rpc  transport=gRPC  GetNavigationStatus(goal_id)
+#   service/navigation/cancel    mode=rpc  transport=gRPC  CancelNavigation(goal_id)
+#
+# Config (passed via `Driver(CMD_INIT, config_json)`):
+#   params_profile  default "slam"        — picks config/nav2_params_<profile>.yml
+#                                            (slam | sim | default)
+#   params_file     unset = derive from params_profile; absolute path overrides
+#   use_sim_time    default false
+#   action_wait_s   default 45.0          — how long to wait for nav2 lifecycle to bring up `navigate_to_pose`
+manifestVersion: 1
+
+package:
+  name: com.robonix.service.nav2
+  version: 0.1.0
+  vendor: robonix
+  description: Nav2 service wrapper exposing service/navigation/* over gRPC.
+  license: Apache-2.0
+
+build: bash scripts/build.sh
+start: bash scripts/start.sh
+
+capabilities:
+  - name: robonix/service/navigation/driver
+  - name: robonix/service/navigation/navigate
+  - name: robonix/service/navigation/status
+  - name: robonix/service/navigation/cancel
