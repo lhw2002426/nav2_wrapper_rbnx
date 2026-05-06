@@ -101,6 +101,100 @@ def _import_ros2() -> None:
     _NavigateToPose = NavigateToPose
 
 
+# ── atlas-driven dependency discovery ────────────────────────────────────────
+# nav2 needs a few upstream data streams. We DO NOT hardcode which package
+# provides them — we ask atlas for each contract and remap the topic into
+# nav2 at launch time. This keeps the wrapper coupled to contracts only;
+# whoever publishes them on this deploy is irrelevant.
+#
+# (config_key, contract_id, default_remap_target) — config_key is the
+# string we look up in `cfg["topic_remap"]` so an operator can override
+# any individual binding without disabling discovery.
+_REQUIRED_DEPS: tuple[tuple[str, str, str], ...] = (
+    # robonix/service/map/occupancy_grid → nav2 expects /map for the
+    # global costmap's StaticLayer.
+    ("map",   "robonix/service/map/occupancy_grid",  "/map"),
+    # robonix/primitive/chassis/odom → nav2 + AMCL want /odom.
+    ("odom",  "robonix/primitive/chassis/odom",      "/odom"),
+)
+
+# Optional deps: if present on atlas, we wire them; if absent, nav2 still
+# launches and just won't have that observation source. Useful when the
+# deploy has e.g. a 3D lidar but nav2's costmap is configured around 2D
+# scan — the operator may legitimately not provide one.
+_OPTIONAL_DEPS: tuple[tuple[str, str, str], ...] = (
+    # 2D scan for ObstacleLayer (some configs); 3D lidar for VoxelLayer.
+    ("scan",        "robonix/primitive/lidar/lidar",   "/scan"),
+    ("scan_cloud",  "robonix/primitive/lidar/lidar3d", "/scanner/cloud"),
+)
+
+
+def _resolve_dep(stub, contract_id: str) -> str | None:
+    """Query atlas for a contract over ROS2; return endpoint or None."""
+    try:
+        resp = stub.QueryCapabilities(pb.QueryCapabilitiesRequest(
+            contract_id=contract_id,
+            transport=pb.TRANSPORT_ROS2,
+        ))
+    except grpc.RpcError as e:
+        log.warning("query %s failed: %s", contract_id, e)
+        return None
+    for rec in resp.records:
+        for iface in rec.interfaces:
+            if iface.contract_id != contract_id or iface.transport != pb.TRANSPORT_ROS2:
+                continue
+            try:
+                conn = stub.ConnectCapability(pb.ConnectCapabilityRequest(
+                    consumer_id=_cap_id,
+                    capability_id=rec.capability_id,
+                    contract_id=contract_id,
+                    transport=pb.TRANSPORT_ROS2,
+                ))
+                if conn.endpoint:
+                    return conn.endpoint
+            except grpc.RpcError as e:
+                log.warning("connect %s failed: %s", contract_id, e)
+    return None
+
+
+def _build_remap_args(cfg: dict) -> tuple[list[str], list[str]]:
+    """Return (remap_args, missing_required).
+    remap_args is a list of `from:=to` strings ready to pass to ros2 launch.
+    missing_required is a list of contract_ids that should have been there
+    but weren't — caller decides whether to defer / degrade / fail."""
+    overrides = dict(cfg.get("topic_remap", {}) or {})
+    remap_args: list[str] = []
+    missing: list[str] = []
+
+    for key, contract_id, default_target in _REQUIRED_DEPS:
+        if key in overrides:
+            ep = str(overrides[key])
+        else:
+            ep = _resolve_dep(_atlas_stub, contract_id) or ""
+        if not ep:
+            missing.append(contract_id)
+            continue
+        # ros2 launch syntax: pass remaps via the ros-args mechanism. The
+        # nav2_bringup composable nodes pick them up via DeclareLaunchArgument.
+        # Cleanest path: rewrite a temp params file with the resolved topic
+        # name (the params YAML is where most nav2 nodes look for it).
+        remap_args.append(f"{key}:={ep}")
+        log.info("resolved %s → %s = %s", contract_id, default_target, ep)
+
+    for key, contract_id, default_target in _OPTIONAL_DEPS:
+        if key in overrides:
+            ep = str(overrides[key])
+        else:
+            ep = _resolve_dep(_atlas_stub, contract_id) or ""
+        if ep:
+            remap_args.append(f"{key}:={ep}")
+            log.info("resolved (optional) %s → %s = %s", contract_id, default_target, ep)
+        else:
+            log.info("optional dep %s not on atlas — skipping", contract_id)
+
+    return remap_args, missing
+
+
 # ── nav2 subprocess management ───────────────────────────────────────────────
 def _resolve_params_file(cfg: dict) -> str:
     explicit = cfg.get("params_file")
@@ -126,7 +220,7 @@ def _resolve_params_file(cfg: dict) -> str:
     return str(p)
 
 
-def _spawn_nav2(cfg: dict) -> None:
+def _spawn_nav2(cfg: dict, remap_args: list[str]) -> None:
     global _nav2_proc
     params_file = _resolve_params_file(cfg)
     use_sim_time = "true" if cfg.get("use_sim_time", False) else "false"
@@ -135,10 +229,18 @@ def _spawn_nav2(cfg: dict) -> None:
         f"use_sim_time:={use_sim_time}",
         f"params_file:={params_file}",
     ]
+    # Topic remaps from atlas resolution arrive as launch-arg-shaped
+    # `<key>:=<resolved-topic>` pairs. The launch file translates them
+    # into ros2 remap ops via `<set_remap>` blocks; for keys the launch
+    # doesn't know about we still pass them — no-op if unused. (Future:
+    # rewrite the params YAML with substitutions for nodes that read
+    # topic names from params rather than via remap.)
+    args.extend(remap_args)
     log_path = _pkg_root / "rbnx-build" / "data" / "nav2.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_fh = open(log_path, "ab", buffering=0)
-    log.info("spawning nav2 (params=%s) → %s", params_file, log_path)
+    log.info("spawning nav2 (params=%s, remaps=%s) → %s",
+             params_file, remap_args, log_path)
     _nav2_proc = subprocess.Popen(
         args, stdout=log_fh, stderr=log_fh, start_new_session=True,
     )
@@ -325,8 +427,19 @@ class _NavDriverServicer(contracts_grpc.ServiceNavigationDriverServicer):
 
         action_wait = float(cfg.get("action_wait_s", 45.0))
 
+        # Discover upstream deps via atlas. If anything REQUIRED is missing
+        # we defer rather than spawn a half-wired nav2; rbnx retries us
+        # once the upstream service registers.
+        remap_args, missing = _build_remap_args(cfg)
+        if missing:
+            return lifecycle_pb2.Driver_Response(
+                ok=False, state="deferred",
+                error=f"missing required atlas contracts: {missing} "
+                      f"(awaiting upstream provider)",
+            )
+
         try:
-            _spawn_nav2(cfg)
+            _spawn_nav2(cfg, remap_args)
         except Exception as e:  # noqa: BLE001
             return lifecycle_pb2.Driver_Response(
                 ok=False, state="error", error=f"spawn nav2 failed: {e}"

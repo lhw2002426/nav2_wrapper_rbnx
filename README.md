@@ -50,22 +50,49 @@ nav2_wrapper_rbnx/
   "params_profile":  "slam",
   "params_file":     "",
   "use_sim_time":    false,
-  "action_wait_s":   45.0
+  "action_wait_s":   45.0,
+  "topic_remap":     {}
 }
 ```
 
 `params_profile` selects `config/nav2_params_<profile>.yml`. Set `params_file` to an absolute path (or path relative to the package root) to override entirely — useful when an operator's local tuning lives outside the package.
 
-## TF + topic prereqs
+`topic_remap` is a per-key override of the atlas-resolved bindings (see *Atlas contract dependencies* below). Empty by default — the wrapper picks whatever atlas reports.
 
-Nav2 wants a healthy `map → odom → base_link` TF chain plus `/scan` (or `/scanner/cloud` projected to scan via `pointcloud_to_laserscan`) for local costmap collision avoidance. In the Ranger Mini deploy these come from:
+## Atlas contract dependencies
 
-- `mapping_rbnx` (rtabmap) → `/map` + `map → odom` TF
-- `ranger_chassis_rbnx` → `/odom` + `odom → base_link` TF
-- `mid360_lidar_rbnx` → `/scanner/cloud`
-- soma's `robot_state_publisher` → `base_link → livox_frame / camera_*` TFs
+The wrapper goes through atlas to find every topic it consumes — it does NOT know which package on a given deploy provides them. At Init time it resolves each contract via `QueryCapabilities` + `ConnectCapability` and passes the resolved topic to `nav2_bringup` as a launch remap.
 
-If the costmap config in `nav2_params_slam.yml` references `/scan` directly, you'll need a `pointcloud_to_laserscan` adapter or a costmap layer that consumes PointCloud2 (the upstream `nav2_costmap_2d` ObstacleLayer supports both — adjust `observation_sources` accordingly).
+**Required** (Init returns `state="deferred"` if any are missing on atlas):
+
+| Contract                           | Resolved into nav2 as |
+| ---------------------------------- | --------------------- |
+| `robonix/service/map/occupancy_grid` | `/map`                |
+| `robonix/primitive/chassis/odom`   | `/odom`               |
+
+**Optional** (Init proceeds if absent; the corresponding observation source is just disabled):
+
+| Contract                          | Resolved into nav2 as |
+| --------------------------------- | --------------------- |
+| `robonix/primitive/lidar/lidar`   | `/scan`               |
+| `robonix/primitive/lidar/lidar3d` | `/scanner/cloud`      |
+
+Any binding can be overridden by the deploy manifest's `topic_remap` block — useful if a deploy has multiple providers for the same contract and you need to pin one explicitly. Example:
+
+```yaml
+- name: nav2
+  url: https://github.com/enkerewpo/nav2_wrapper_rbnx
+  config:
+    topic_remap:
+      map: /robonix/map/occupancy_grid     # bypass atlas resolution
+      scan_cloud: /scanner/cloud_filtered  # tap a downstream filter
+```
+
+## TF prereqs
+
+Nav2 also needs a healthy `map → odom → base_link → sensor` TF chain. TF is currently a global ROS side-channel rather than an atlas contract — robonix doesn't yet route TF discovery through atlas (open issue). Until it does, ensure whichever stack you deploy publishes the chain. The convention is: the SLAM provider owns `map → odom`, the chassis provider owns `odom → base_link`, and a body-description provider owns `base_link → sensor_*` via `robot_state_publisher`.
+
+If your costmap config (`config/nav2_params_*.yml`) references `/scan` but only `primitive/lidar/lidar3d` (PointCloud2) is on atlas, drop a `pointcloud_to_laserscan` adapter into the launch — or switch the costmap layer to `VoxelLayer` / `ObstacleLayer` with `data_type: PointCloud2`. The upstream `nav2_costmap_2d` supports both.
 
 ## License
 
