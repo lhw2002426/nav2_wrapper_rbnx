@@ -3,15 +3,12 @@
 # Start the atlas bridge. NO nav2 spawn here — `ros2 launch
 # nav2_bringup navigation_launch.py …` runs inside Driver(CMD_INIT).
 set -euo pipefail
-: "${AMENT_TRACE_SETUP_FILES:=}"
-: "${COLCON_TRACE:=}"
-export AMENT_TRACE_SETUP_FILES COLCON_TRACE
 PKG="${RBNX_PACKAGE_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 cd "$PKG"
 
 ROS_DISTRO="${ROS_DISTRO:-humble}"
 # shellcheck disable=SC1091
-source "/opt/ros/${ROS_DISTRO}/setup.bash"
+set +u; source "/opt/ros/${ROS_DISTRO}/setup.bash"; set -u
 
 export PYTHONPATH="$PKG/rbnx-build/codegen/proto_gen:${PYTHONPATH:-}"
 if ROBONIX_PY="$(rbnx path robonix-py 2>/dev/null)"; then
