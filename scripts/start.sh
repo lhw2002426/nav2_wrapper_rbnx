@@ -3,6 +3,9 @@
 # Start the atlas bridge. NO nav2 spawn here — `ros2 launch
 # nav2_bringup navigation_launch.py …` runs inside Driver(CMD_INIT).
 set -euo pipefail
+: "${AMENT_TRACE_SETUP_FILES:=}"
+: "${COLCON_TRACE:=}"
+export AMENT_TRACE_SETUP_FILES COLCON_TRACE
 PKG="${RBNX_PACKAGE_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 cd "$PKG"
 

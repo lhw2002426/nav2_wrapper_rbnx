@@ -5,6 +5,9 @@
 #   sudo apt install ros-humble-nav2-bringup ros-humble-navigation2
 # (This is the same path the robot was already using.)
 set -euo pipefail
+: "${AMENT_TRACE_SETUP_FILES:=}"
+: "${COLCON_TRACE:=}"
+export AMENT_TRACE_SETUP_FILES COLCON_TRACE
 PKG="${RBNX_PACKAGE_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 cd "$PKG"
 CLEAN="${RBNX_BUILD_CLEAN:-}"
