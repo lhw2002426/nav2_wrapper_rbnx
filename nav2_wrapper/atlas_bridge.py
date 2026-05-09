@@ -65,7 +65,9 @@ import navigation_pb2  # noqa: E402
 import robonix_contracts_pb2_grpc as contracts_grpc  # noqa: E402
 
 CMD_INIT = 0
-CMD_SHUTDOWN = 1
+CMD_ACTIVATE = 1
+CMD_DEACTIVATE = 2
+CMD_SHUTDOWN = 3
 
 
 # ── shared state ─────────────────────────────────────────────────────────────
@@ -412,9 +414,17 @@ class _NavDriverServicer(contracts_grpc.ServiceNavigationDriverServicer):
                     ok=False, state="error", error=f"bad config_json: {e}"
                 )
             return self._init(cfg)
+        if cmd == CMD_ACTIVATE:
+            # primitives do all bring-up in CMD_INIT; ACTIVATE
+            # is a framework no-op that flips the cap to ACTIVE
+            # so consumers may begin calling.
+            return lifecycle_pb2.Driver_Response(ok=True, state="active", error="")
+        if cmd == CMD_DEACTIVATE:
+            # framework no-op back to INACTIVE; v1 doesn't evict.
+            return lifecycle_pb2.Driver_Response(ok=True, state="inactive", error="")
         if cmd == CMD_SHUTDOWN:
             _kill_nav2()
-            return lifecycle_pb2.Driver_Response(ok=True, state="shutdown", error="")
+            return lifecycle_pb2.Driver_Response(ok=True, state="terminated", error="")
         return lifecycle_pb2.Driver_Response(
             ok=False, state="error", error=f"invalid command {cmd}"
         )
@@ -423,7 +433,7 @@ class _NavDriverServicer(contracts_grpc.ServiceNavigationDriverServicer):
         global _initialized
         with _state_lock:
             if _initialized:
-                return lifecycle_pb2.Driver_Response(ok=True, state="ready", error="")
+                return lifecycle_pb2.Driver_Response(ok=True, state="inactive", error="")
 
         action_wait = float(cfg.get("action_wait_s", 45.0))
 
@@ -475,7 +485,7 @@ class _NavDriverServicer(contracts_grpc.ServiceNavigationDriverServicer):
         with _state_lock:
             _initialized = True
         log.info("init complete: nav2 alive, navigate/status/cancel declared")
-        return lifecycle_pb2.Driver_Response(ok=True, state="ready", error="")
+        return lifecycle_pb2.Driver_Response(ok=True, state="inactive", error="")
 
 
 def _quat_to_yaw(z: float, w: float) -> float:
