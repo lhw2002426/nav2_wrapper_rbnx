@@ -10,9 +10,9 @@ ROS_DISTRO="${ROS_DISTRO:-humble}"
 # shellcheck disable=SC1091
 set +u; source "/opt/ros/${ROS_DISTRO}/setup.bash"; set -u
 
-export PYTHONPATH="$PKG/rbnx-build/codegen/proto_gen:${PYTHONPATH:-}"
-if ROBONIX_PY="$(rbnx path robonix-py 2>/dev/null)"; then
-    export PYTHONPATH="$ROBONIX_PY:$PYTHONPATH"
+export PYTHONPATH="$PKG/rbnx-build/codegen/proto_gen:$PKG/rbnx-build/codegen/robonix_mcp_types:$PKG:${PYTHONPATH:-}"
+if ROBONIX_API="$(rbnx path robonix-api 2>/dev/null)"; then
+    export PYTHONPATH="$ROBONIX_API:$PYTHONPATH"
 fi
 
 exec python3 -m nav2_wrapper.atlas_bridge

@@ -1,28 +1,36 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""nav2_wrapper_rbnx — atlas bridge (driver-init lifecycle).
+"""nav2_wrapper_rbnx — atlas bridge (driver-init lifecycle + MCP tools).
 
-Wraps system-installed nav2_bringup. Owns service/navigation/*.
+Wraps system-installed nav2_bringup. Owns ``robonix/service/navigation/*``.
+
+This bridge plugs into the ``robonix_api.Service`` runtime (same shape as
+``services/simple_nav``) so pilot can list / call the navigation tools as
+typed MCP endpoints — without that, the nav2 wrapper is reachable only via
+raw gRPC and the LLM has no idea how to drive the robot.
 
 Spawn order:
-  1. start.sh launches THIS process — no nav2 spawn yet.
-  2. main() starts the gRPC server (Driver + Navigate + Status + Cancel
-     servicers), RegisterCapability, declares ONLY service/navigation/driver.
-  3. rbnx boot calls Driver(CMD_INIT, config_json).
-  4. Init handler: pick params_file from config, spawn `ros2 launch
-     nav2_bringup navigation_launch.py …`, wait for the navigate_to_pose
-     action server to come up, declare navigate/status/cancel on atlas.
+  1. ``start.sh`` launches THIS process via ``python3 -m
+     nav2_wrapper.atlas_bridge``.
+  2. ``Service.run()`` opens the MCP HTTP server, registers the cap on atlas,
+     and blocks awaiting ``Driver(CMD_INIT, config_json)``.
+  3. ``rbnx boot`` calls Driver(CMD_INIT). The ``@service.on_init`` handler
+     resolves required upstream contracts (map, odom, optionally lidar),
+     spawns ``ros2 launch nav2_bringup navigation_launch.py …``, brings up
+     a ``rclpy`` node + ``NavigateToPose`` ActionClient, and waits for the
+     action server to advertise.
+  4. After init, three MCP tools are live for pilot:
+       * ``robonix/service/navigation/navigate``
+       * ``robonix/service/navigation/status``
+       * ``robonix/service/navigation/cancel``
 
-NavigateToPose action client uses the existing /odom + /map + /tf the
-rest of the stack provides. Goals are tracked in an internal dict so
-status() / cancel() work even after the goal has terminated.
-
-Config (passed via Driver(CMD_INIT, config_json)):
-    params_profile   default "slam"     → config/nav2_params_<profile>.yml
-                                          (slam | sim | default)
+Config (passed via ``Driver(CMD_INIT, config_json)``):
+    params_profile   default "slam"  → config/nav2_params_<profile>.yml
+                                        (slam | sim | default)
     params_file      unset = derive from params_profile (override w/ abs path)
     use_sim_time     default false
-    action_wait_s    default 45.0       — nav2 lifecycle takes a while
+    action_wait_s    default 45.0    — nav2 lifecycle takes a while
+    topic_remap      dict, per-key override of atlas-resolved bindings
 """
 from __future__ import annotations
 
@@ -33,50 +41,25 @@ import os
 import queue
 import signal
 import subprocess
-import sys
 import threading
 import time
 import uuid
-from concurrent import futures
 from pathlib import Path
 
-logging.basicConfig(level=os.environ.get("NAV2_LOG_LEVEL", "INFO"),
-                    format="[nav2_wrapper] %(message)s")
+from robonix_api import ATLAS, Service, Ok, Err, Deferred  # noqa: E402
+
 log = logging.getLogger("nav2_wrapper")
 
-def _ensure_proto_gen() -> None:
-    d = Path(__file__).resolve().parent
-    while d.parent != d:
-        pg = d / "rbnx-build" / "codegen" / "proto_gen"
-        if pg.is_dir() and (pg / "atlas_pb2.py").exists():
-            sys.path.insert(0, str(pg))
-            return
-        d = d.parent
-
-_ensure_proto_gen()
-
-import grpc  # noqa: E402
-import atlas_pb2 as pb  # noqa: E402
-import atlas_pb2_grpc as pb_grpc  # noqa: E402
-import lifecycle_pb2  # noqa: E402
-import navigation_pb2  # noqa: E402
-import robonix_contracts_pb2_grpc as contracts_grpc  # noqa: E402
-
-CMD_INIT = 0
-CMD_ACTIVATE = 1
-CMD_DEACTIVATE = 2
-CMD_SHUTDOWN = 3
+nav2 = Service(id=os.environ.get("ROBONIX_CAPABILITY_ID", "nav2"),
+               namespace="robonix/service/navigation")
 
 # ── shared state ─────────────────────────────────────────────────────────────
 _state_lock = threading.Lock()
-_atlas_stub: pb_grpc.AtlasStub | None = None
-_cap_id: str = ""
 _pkg_root: Path = Path(__file__).resolve().parent.parent
-_nav2_proc: subprocess.Popen | None = None
-_grpc_server: grpc.Server | None = None   # prevent GC of the gRPC server
+_nav2_proc: "subprocess.Popen | None" = None
 _initialized = False
 
-# ROS2 client state (initialized inside Driver.Init after nav2 is alive)
+# ROS2 client state (initialized after nav2 lifecycle is alive)
 _ros_node = None
 _nav_action_client = None
 _nav_action_ready = False
@@ -86,6 +69,8 @@ _GoalStatus = None
 _nav_queue: "queue.Queue[tuple[str, dict]]" = queue.Queue()
 _goal_states: dict[str, dict] = {}
 _goal_handles: dict[str, object] = {}
+_last_goal_id: str = ""
+
 
 def _import_ros2() -> None:
     global _NavigateToPose, _PoseStamped, _GoalStatus
@@ -99,96 +84,78 @@ def _import_ros2() -> None:
     _PoseStamped = RosPoseStamped
     _NavigateToPose = NavigateToPose
 
+
 # ── atlas-driven dependency discovery ────────────────────────────────────────
 # nav2 needs a few upstream data streams. We DO NOT hardcode which package
 # provides them — we ask atlas for each contract and remap the topic into
-# nav2 at launch time. This keeps the wrapper coupled to contracts only;
-# whoever publishes them on this deploy is irrelevant.
+# nav2 at launch time. This keeps the wrapper coupled to contracts only.
 #
-# (config_key, contract_id, default_remap_target) — config_key is the
-# string we look up in `cfg["topic_remap"]` so an operator can override
-# any individual binding without disabling discovery.
-_REQUIRED_DEPS: tuple[tuple[str, str, str], ...] = (
-    # robonix/service/map/occupancy_grid → nav2 expects /map for the
-    # global costmap's StaticLayer.
-    ("map",   "robonix/service/map/occupancy_grid",  "/map"),
-    # robonix/primitive/chassis/odom → nav2 + AMCL want /odom.
-    ("odom",  "robonix/primitive/chassis/odom",      "/odom"),
+# (config_key, contract_id) — config_key matches the launch arg nav2_bringup's
+# navigation_launch.py exposes.
+_REQUIRED_DEPS: tuple[tuple[str, str], ...] = (
+    ("map",   "robonix/service/map/occupancy_grid"),
+    ("odom",  "robonix/primitive/chassis/odom"),
 )
 
-# Optional deps: if present on atlas, we wire them; if absent, nav2 still
-# launches and just won't have that observation source. Useful when the
-# deploy has e.g. a 3D lidar but nav2's costmap is configured around 2D
-# scan — the operator may legitimately not provide one.
-_OPTIONAL_DEPS: tuple[tuple[str, str, str], ...] = (
-    # 2D scan for ObstacleLayer (some configs); 3D lidar for VoxelLayer.
-    ("scan",        "robonix/primitive/lidar/lidar",   "/scan"),
-    ("scan_cloud",  "robonix/primitive/lidar/lidar3d", "/scanner/cloud"),
+# Optional deps: if present on atlas, we wire them; otherwise nav2 still
+# launches and just won't have that observation source.
+_OPTIONAL_DEPS: tuple[tuple[str, str], ...] = (
+    ("scan",        "robonix/primitive/lidar/lidar"),
+    ("scan_cloud",  "robonix/primitive/lidar/lidar3d"),
 )
 
-def _resolve_dep(stub, contract_id: str) -> str | None:
+
+def _resolve_dep(contract_id: str) -> str | None:
     """Query atlas for a contract over ROS2; return endpoint or None."""
     try:
-        resp = stub.QueryCapabilities(pb.QueryCapabilitiesRequest(
-            contract_id=contract_id,
-            transport=pb.TRANSPORT_ROS2,
-        ))
-    except grpc.RpcError as e:
+        caps = ATLAS.find_capability(contract_id=contract_id, transport="ros2")
+    except Exception as e:  # noqa: BLE001
         log.warning("query %s failed: %s", contract_id, e)
         return None
-    for rec in resp.records:
-        for iface in rec.interfaces:
-            if iface.contract_id != contract_id or iface.transport != pb.TRANSPORT_ROS2:
-                continue
-            try:
-                conn = stub.ConnectCapability(pb.ConnectCapabilityRequest(
-                    consumer_id=_cap_id,
-                    capability_id=rec.capability_id,
-                    contract_id=contract_id,
-                    transport=pb.TRANSPORT_ROS2,
-                ))
-                if conn.endpoint:
-                    return conn.endpoint
-            except grpc.RpcError as e:
-                log.warning("connect %s failed: %s", contract_id, e)
-    return None
+    if not caps:
+        return None
+    try:
+        ch = nav2.connect_capability(caps[0], contract_id, "ros2")
+    except Exception as e:  # noqa: BLE001
+        log.warning("connect %s failed: %s", contract_id, e)
+        return None
+    ep = ch.endpoint
+    try:
+        ch.close()
+    except Exception:  # noqa: BLE001
+        pass
+    return ep or None
+
 
 def _build_remap_args(cfg: dict) -> tuple[list[str], list[str]]:
-    """Return (remap_args, missing_required).
-    remap_args is a list of `from:=to` strings ready to pass to ros2 launch.
-    missing_required is a list of contract_ids that should have been there
-    but weren't — caller decides whether to defer / degrade / fail."""
     overrides = dict(cfg.get("topic_remap", {}) or {})
     remap_args: list[str] = []
     missing: list[str] = []
 
-    for key, contract_id, default_target in _REQUIRED_DEPS:
+    for key, contract_id in _REQUIRED_DEPS:
         if key in overrides:
             ep = str(overrides[key])
         else:
-            ep = _resolve_dep(_atlas_stub, contract_id) or ""
+            ep = _resolve_dep(contract_id) or ""
         if not ep:
             missing.append(contract_id)
             continue
-        # ros2 launch syntax: pass remaps via the ros-args mechanism. The
-        # nav2_bringup composable nodes pick them up via DeclareLaunchArgument.
-        # Cleanest path: rewrite a temp params file with the resolved topic
-        # name (the params YAML is where most nav2 nodes look for it).
         remap_args.append(f"{key}:={ep}")
-        log.info("resolved %s → %s = %s", contract_id, default_target, ep)
+        log.info("resolved %s = %s", contract_id, ep)
 
-    for key, contract_id, default_target in _OPTIONAL_DEPS:
+    for key, contract_id in _OPTIONAL_DEPS:
         if key in overrides:
             ep = str(overrides[key])
         else:
-            ep = _resolve_dep(_atlas_stub, contract_id) or ""
+            ep = _resolve_dep(contract_id) or ""
         if ep:
             remap_args.append(f"{key}:={ep}")
-            log.info("resolved (optional) %s → %s = %s", contract_id, default_target, ep)
+            log.info("resolved (optional) %s = %s", contract_id, ep)
         else:
             log.info("optional dep %s not on atlas — skipping", contract_id)
 
     return remap_args, missing
+
 
 # ── nav2 subprocess management ───────────────────────────────────────────────
 def _resolve_params_file(cfg: dict) -> str:
@@ -208,11 +175,15 @@ def _resolve_params_file(cfg: dict) -> str:
     }
     p = candidates.get(profile)
     if p is None:
-        raise ValueError(f"unknown params_profile {profile!r}; "
-                         f"options: {list(candidates)}")
+        raise ValueError(
+            f"unknown params_profile {profile!r}; options: {list(candidates)}"
+        )
     if not p.is_file():
-        raise FileNotFoundError(f"params file for profile {profile!r} missing: {p}")
+        raise FileNotFoundError(
+            f"params file for profile {profile!r} missing: {p}"
+        )
     return str(p)
+
 
 def _spawn_nav2(cfg: dict, remap_args: list[str]) -> None:
     global _nav2_proc
@@ -223,12 +194,6 @@ def _spawn_nav2(cfg: dict, remap_args: list[str]) -> None:
         f"use_sim_time:={use_sim_time}",
         f"params_file:={params_file}",
     ]
-    # Topic remaps from atlas resolution arrive as launch-arg-shaped
-    # `<key>:=<resolved-topic>` pairs. The launch file translates them
-    # into ros2 remap ops via `<set_remap>` blocks; for keys the launch
-    # doesn't know about we still pass them — no-op if unused. (Future:
-    # rewrite the params YAML with substitutions for nodes that read
-    # topic names from params rather than via remap.)
     args.extend(remap_args)
     log_path = _pkg_root / "rbnx-build" / "data" / "nav2.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -238,6 +203,7 @@ def _spawn_nav2(cfg: dict, remap_args: list[str]) -> None:
     _nav2_proc = subprocess.Popen(
         args, stdout=log_fh, stderr=log_fh, start_new_session=True,
     )
+
 
 def _kill_nav2() -> None:
     p = _nav2_proc
@@ -255,15 +221,20 @@ def _kill_nav2() -> None:
         except ProcessLookupError:
             pass
 
+
 # ── ROS2 wiring (started after nav2 is alive) ────────────────────────────────
 def _start_ros2_thread() -> None:
     """Spin a rclpy node + ActionClient. Re-entrant: only acts once."""
     def _run():
-        global _ros_node, _nav_action_client, _nav_action_ready
+        global _ros_node, _nav_action_client
         import rclpy  # type: ignore
         from rclpy.executors import MultiThreadedExecutor  # type: ignore
         from rclpy.action import ActionClient  # type: ignore
-        rclpy.init(args=None)
+        try:
+            rclpy.init(args=None)
+        except Exception:  # noqa: BLE001
+            # rclpy may already be initialized by another component; that's OK.
+            pass
         node = rclpy.create_node("nav2_wrapper_atlas_bridge")
         _ros_node = node
         _import_ros2()
@@ -273,7 +244,6 @@ def _start_ros2_thread() -> None:
         log.info("rclpy node up; waiting on navigate_to_pose action server")
         while rclpy.ok():
             executor.spin_once(timeout_sec=0.05)
-            # Drain goals queued by Navigate gRPC handler.
             while True:
                 try:
                     gid, payload = _nav_queue.get_nowait()
@@ -282,16 +252,19 @@ def _start_ros2_thread() -> None:
                 _dispatch_goal(node, gid, payload)
     threading.Thread(target=_run, daemon=True).start()
 
+
 def _wait_for_action(timeout_s: float) -> bool:
-    """Block until `navigate_to_pose` is ready (post-Init nav2 lifecycle bring-up)."""
+    """Block until ``navigate_to_pose`` is ready (post-Init nav2 lifecycle)."""
     global _nav_action_ready
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        if _nav_action_client is not None and _nav_action_client.wait_for_server(timeout_sec=0.5):
+        if _nav_action_client is not None and \
+                _nav_action_client.wait_for_server(timeout_sec=0.5):
             _nav_action_ready = True
             return True
         time.sleep(0.5)
     return False
+
 
 def _make_pose(node, frame_id: str, x: float, y: float, yaw: float):
     g = _PoseStamped()
@@ -303,6 +276,7 @@ def _make_pose(node, frame_id: str, x: float, y: float, yaw: float):
     g.pose.orientation.z = math.sin(yaw / 2.0)
     g.pose.orientation.w = math.cos(yaw / 2.0)
     return g
+
 
 def _goal_status_name(status: int) -> str:
     if _GoalStatus is None:
@@ -319,18 +293,23 @@ def _goal_status_name(status: int) -> str:
     }
     return m.get(int(status), str(int(status)))
 
+
+def _set_state(gid: str, **kw) -> None:
+    global _last_goal_id
+    with _state_lock:
+        _goal_states[gid] = kw
+        _last_goal_id = gid
+
+
 def _goal_response_cb(fut, gid: str):
     try:
         gh = fut.result()
     except Exception as e:  # noqa: BLE001
-        with _state_lock:
-            _goal_states[gid] = {"status": "FAILED", "accepted": False,
-                                 "terminal": True, "error": str(e)}
+        _set_state(gid, status="FAILED", accepted=False,
+                   terminal=True, error=str(e))
         return
     if not gh.accepted:
-        with _state_lock:
-            _goal_states[gid] = {"status": "REJECTED", "accepted": False,
-                                 "terminal": True}
+        _set_state(gid, status="REJECTED", accepted=False, terminal=True)
         return
     with _state_lock:
         _goal_handles[gid] = gh
@@ -338,6 +317,7 @@ def _goal_response_cb(fut, gid: str):
                              "terminal": False}
     res_fut = gh.get_result_async()
     res_fut.add_done_callback(lambda f: _result_cb(f, gid))
+
 
 def _result_cb(fut, gid: str):
     try:
@@ -353,325 +333,195 @@ def _result_cb(fut, gid: str):
                                  "terminal": True, "error": str(e)}
             _goal_handles.pop(gid, None)
 
+
 def _dispatch_goal(node, gid: str, payload: dict):
-    pose = _make_pose(node, payload["frame_id"], payload["x"], payload["y"], payload["yaw"])
+    pose = _make_pose(node, payload["frame_id"], payload["x"],
+                      payload["y"], payload["yaw"])
     goal_msg = _NavigateToPose.Goal()
     goal_msg.pose = pose
     if _nav_action_client is None or not _nav_action_ready:
-        with _state_lock:
-            _goal_states[gid] = {"status": "REJECTED", "accepted": False,
-                                 "terminal": True,
-                                 "error": "nav action server not ready"}
+        _set_state(gid, status="REJECTED", accepted=False, terminal=True,
+                   error="nav action server not ready")
         return
     send_future = _nav_action_client.send_goal_async(goal_msg)
     send_future.add_done_callback(lambda f, g=gid: _goal_response_cb(f, g))
-    with _state_lock:
-        _goal_states[gid] = {"status": "SENT", "accepted": False, "terminal": False}
+    _set_state(gid, status="SENT", accepted=False, terminal=False)
 
-# ── data-interface declaration helpers ───────────────────────────────────────
-def _decl_grpc(contract_id: str, port: int, service_name: str, method: str) -> None:
-    if _atlas_stub is None:
-        return
-    _atlas_stub.DeclareInterface(pb.DeclareInterfaceRequest(
-        capability_id=_cap_id,
-        contract_id=contract_id,
-        transport=pb.TRANSPORT_GRPC,
-        endpoint=f"127.0.0.1:{port}",
-        params=pb.TransportParams(grpc=pb.GrpcParams(
-            proto_file="robonix_contracts.proto",
-            service_name=service_name,
-            method=method,
-        )),
-    ))
-
-# ── gRPC servicers ───────────────────────────────────────────────────────────
-class _NavDriverServicer(contracts_grpc.RobonixServiceNavigationDriverServicer):
-    def Driver(self, request, context):
-        cmd = int(request.command)
-        if cmd == CMD_INIT:
-            try:
-                cfg = json.loads(request.config_json) if request.config_json else {}
-            except json.JSONDecodeError as e:
-                return lifecycle_pb2.Driver_Response(
-                    ok=False, state="error", error=f"bad config_json: {e}"
-                )
-            return self._init(cfg)
-        if cmd == CMD_ACTIVATE:
-            # primitives do all bring-up in CMD_INIT; ACTIVATE
-            # is a framework no-op that flips the cap to ACTIVE
-            # so consumers may begin calling.
-            return lifecycle_pb2.Driver_Response(ok=True, state="active", error="")
-        if cmd == CMD_DEACTIVATE:
-            # framework no-op back to INACTIVE; v1 doesn't evict.
-            return lifecycle_pb2.Driver_Response(ok=True, state="inactive", error="")
-        if cmd == CMD_SHUTDOWN:
-            _kill_nav2()
-            return lifecycle_pb2.Driver_Response(ok=True, state="terminated", error="")
-        return lifecycle_pb2.Driver_Response(
-            ok=False, state="error", error=f"invalid command {cmd}"
-        )
-
-    def _init(self, cfg: dict):
-        global _initialized
-        with _state_lock:
-            if _initialized:
-                return lifecycle_pb2.Driver_Response(ok=True, state="inactive", error="")
-
-        action_wait = float(cfg.get("action_wait_s", 45.0))
-
-        # Discover upstream deps via atlas. If anything REQUIRED is missing
-        # we defer rather than spawn a half-wired nav2; rbnx retries us
-        # once the upstream service registers.
-        remap_args, missing = _build_remap_args(cfg)
-        if missing:
-            return lifecycle_pb2.Driver_Response(
-                ok=False, state="deferred",
-                error=f"missing required atlas contracts: {missing} "
-                      f"(awaiting upstream provider)",
-            )
-
-        try:
-            _spawn_nav2(cfg, remap_args)
-        except Exception as e:  # noqa: BLE001
-            return lifecycle_pb2.Driver_Response(
-                ok=False, state="error", error=f"spawn nav2 failed: {e}"
-            )
-
-        # Bring up our rclpy node + ActionClient. nav2 lifecycle takes a
-        # while to advertise navigate_to_pose; the ROS2 thread waits.
-        _start_ros2_thread()
-
-        if not _wait_for_action(action_wait):
-            # Don't kill nav2 — degraded state is still useful (operator
-            # can investigate). Mark failure but leave the process up.
-            return lifecycle_pb2.Driver_Response(
-                ok=False, state="degraded",
-                error=f"navigate_to_pose action server did not come up within {action_wait:.1f}s",
-            )
-
-        # Declare the data interfaces only after the action server is alive.
-        try:
-            port = int(os.environ.get("NAV2_DRIVER_PORT", "50235"))
-            _decl_grpc("robonix/service/navigation/navigate", port,
-                       "ServiceNavigationNavigate", "Navigate")
-            _decl_grpc("robonix/service/navigation/status", port,
-                       "ServiceNavigationStatus", "GetNavigationStatus")
-            _decl_grpc("robonix/service/navigation/cancel", port,
-                       "ServiceNavigationCancel", "CancelNavigation")
-        except grpc.RpcError as e:
-            if e.code() != grpc.StatusCode.ALREADY_EXISTS:
-                return lifecycle_pb2.Driver_Response(
-                    ok=False, state="error", error=f"declare failed: {e.details()}"
-                )
-
-        with _state_lock:
-            _initialized = True
-        log.info("init complete: nav2 alive, navigate/status/cancel declared")
-        return lifecycle_pb2.Driver_Response(ok=True, state="inactive", error="")
 
 def _quat_to_yaw(z: float, w: float) -> float:
     return 2.0 * math.atan2(z, w)
 
-class _NavigateServicer(contracts_grpc.RobonixServiceNavigationNavigateServicer):
-    def Navigate(self, request, context):
-        if _ros_node is None:
-            return navigation_pb2.Navigate_Response(
-                accepted=False, status_message="ROS2 not initialized"
-            )
-        gid = str(uuid.uuid4())
-        # request.goal is a geometry_msgs/PoseStamped per the contract IDL.
-        goal = request.goal
-        frame_id = goal.header.frame_id or "map"
-        yaw = _quat_to_yaw(goal.pose.orientation.z, goal.pose.orientation.w)
-        _nav_queue.put((gid, {
-            "frame_id": frame_id,
-            "x": float(goal.pose.position.x),
-            "y": float(goal.pose.position.y),
-            "yaw": float(yaw),
-        }))
-        with _state_lock:
-            _goal_states[gid] = {"status": "QUEUED", "accepted": False,
-                                 "terminal": False}
-        return navigation_pb2.Navigate_Response(
-            accepted=True,
-            status_message=json.dumps({"goal_id": gid, "status": "queued"}),
-        )
 
-class _StatusServicer(contracts_grpc.RobonixServiceNavigationStatusServicer):
-    def GetNavigationStatus(self, request, context):
-        gid = request.goal_id
-        with _state_lock:
-            st = _goal_states.get(gid)
-        if st is None:
-            return navigation_pb2.GetNavigationStatus_Response(
-                known=False, status="unknown", terminal=True,
-            )
-        return navigation_pb2.GetNavigationStatus_Response(
-            known=True,
-            status=st.get("status", "UNKNOWN"),
-            terminal=bool(st.get("terminal", False)),
-        )
+# ── MCP tools (typed against codegen Request/Response from srv) ──────────────
+# The codegen output lives at rbnx-build/codegen/robonix_mcp_types/, exposed
+# by start.sh on PYTHONPATH. Mirrors services/simple_nav.
+from navigation_mcp import (  # noqa: E402
+    Navigate_Request, Navigate_Response,
+    GetNavigationStatus_Request, GetNavigationStatus_Response,
+    CancelNavigation_Request, CancelNavigation_Response,
+)
 
-class _CancelServicer(contracts_grpc.RobonixServiceNavigationCancelServicer):
-    def CancelNavigation(self, request, context):
-        gid = request.goal_id
-        with _state_lock:
-            gh = _goal_handles.get(gid)
-        if gh is None:
-            return navigation_pb2.CancelNavigation_Response(
-                accepted=False, message="no active goal handle",
-            )
-        try:
-            gh.cancel_goal_async()  # type: ignore[union-attr]
-        except Exception as e:  # noqa: BLE001
-            return navigation_pb2.CancelNavigation_Response(
-                accepted=False, message=f"cancel failed: {e}",
-            )
-        return navigation_pb2.CancelNavigation_Response(
-            accepted=True, message="cancel_requested",
-        )
 
-def _start_grpc(requested_port: int) -> int:
-    """Start the gRPC server. Returns the port grpc actually bound to.
+@nav2.mcp("robonix/service/navigation/navigate")
+def navigate(req: Navigate_Request) -> Navigate_Response:
+    """Drive the robot to a goal pose using Nav2 ``navigate_to_pose``.
 
-    grpc.add_insecure_port() returns 0 on bind failure (port already in use,
-    AF_INET6 disabled, etc.) and does NOT raise. The earlier code logged
-    "serving on 0.0.0.0:<requested>" unconditionally and then declared the
-    requested port to atlas — when the bind silently failed atlas was told
-    a port nobody was listening on, and Driver(CMD_INIT)/(CMD_ACTIVATE) hit
-    `Connection refused` with no diagnostic. Always log the actual bound
-    port, fall back to OS-assigned :0 on bind failure, and abort hard if
-    even :0 fails (something is very wrong with the network stack).
+    The request carries a ``geometry_msgs/PoseStamped`` under ``goal``:
+
+        goal.header.frame_id      "map" by default
+        goal.pose.position.x|y    map-frame target in meters
+        goal.pose.orientation.{z,w} planar-yaw quaternion
+                                    (z = sin(yaw/2), w = cos(yaw/2);
+                                    leave (z=0,w=1) to skip yaw control)
+
+    Returns ``goal_id`` for polling via the sibling ``status`` / ``cancel``
+    contracts. ``status_message`` is a short free-form human-readable string —
+    never a JSON envelope.
     """
-    global _grpc_server
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
-    contracts_grpc.add_RobonixServiceNavigationDriverServicer_to_server(
-        _NavDriverServicer(), server)
-    contracts_grpc.add_RobonixServiceNavigationNavigateServicer_to_server(
-        _NavigateServicer(), server)
-    contracts_grpc.add_RobonixServiceNavigationStatusServicer_to_server(
-        _StatusServicer(), server)
-    contracts_grpc.add_RobonixServiceNavigationCancelServicer_to_server(
-        _CancelServicer(), server)
-
-    # Try binding on both IPv4 and IPv6 to ensure the port is reachable
-    # via 127.0.0.1 (which atlas/rbnx uses). [::] alone may only listen
-    # on IPv6 on kernels with net.ipv6.bindv6only=1.
-    bound = server.add_insecure_port(f"0.0.0.0:{requested_port}")
-    log.info("add_insecure_port(0.0.0.0:%d) returned %d", requested_port, bound)
-    if bound == 0:
-        log.warning(
-            "bind to 0.0.0.0:%d FAILED (port busy?). "
-            "Retrying with 0.0.0.0:0 (OS-assigned port).",
-            requested_port,
+    if not _initialized:
+        return Navigate_Response(
+            accepted=False, goal_id="",
+            status_message="nav2 not initialized (Driver(CMD_INIT) not run)",
         )
-        bound = server.add_insecure_port("0.0.0.0:0")
-        log.info("add_insecure_port(0.0.0.0:0) returned %d", bound)
-        if bound == 0:
-            log.error(
-                "add_insecure_port(0.0.0.0:0) also returned 0 — gRPC cannot bind "
-                "ANY port. Aborting; rbnx will see this process exit and report "
-                "spawn failure cleanly instead of timing out on a phantom endpoint."
-            )
-            sys.exit(2)
+    goal = req.goal
+    frame_id = goal.header.frame_id or "map"
+    yaw = _quat_to_yaw(goal.pose.orientation.z, goal.pose.orientation.w)
+    gid = f"nav-{uuid.uuid4().hex[:8]}"
+    _nav_queue.put((gid, {
+        "frame_id": frame_id,
+        "x": float(goal.pose.position.x),
+        "y": float(goal.pose.position.y),
+        "yaw": float(yaw),
+    }))
+    _set_state(gid, status="QUEUED", accepted=False, terminal=False)
+    msg = (f"goto ({goal.pose.position.x:.2f},{goal.pose.position.y:.2f})"
+           f" yaw={yaw:.2f} frame={frame_id}")
+    return Navigate_Response(accepted=True, goal_id=gid, status_message=msg)
 
-    server.start()
-    # Keep a global reference so the server (and its listening socket) are
-    # never garbage-collected while the process is alive.
-    _grpc_server = server
-    log.info(
-        "Navigation gRPC serving on 0.0.0.0:%d (requested %d), server=%r",
-        bound,
-        requested_port,
-        server,
+
+@nav2.mcp("robonix/service/navigation/status")
+def status(req: GetNavigationStatus_Request) -> GetNavigationStatus_Response:
+    """Get current status of a navigation goal.
+
+    Empty ``goal_id`` returns the most recently dispatched goal. ``status``
+    is one of ``QUEUED | SENT | ACCEPTED | EXECUTING | CANCELING | SUCCEEDED
+    | CANCELED | ABORTED | REJECTED | FAILED | UNKNOWN``. ``terminal`` is
+    True once the goal will not change status anymore.
+    """
+    if not _initialized:
+        return GetNavigationStatus_Response(
+            known=False, status="nav2 not initialized", terminal=True,
+        )
+    gid = (req.goal_id or "").strip()
+    if not gid:
+        gid = _last_goal_id
+    with _state_lock:
+        st = _goal_states.get(gid)
+    if st is None:
+        return GetNavigationStatus_Response(
+            known=False, status="unknown", terminal=True,
+        )
+    return GetNavigationStatus_Response(
+        known=True,
+        status=str(st.get("status", "UNKNOWN")),
+        terminal=bool(st.get("terminal", False)),
     )
-    return bound
 
-def _heartbeat_loop() -> None:
-    while True:
-        time.sleep(15.0)
-        if _atlas_stub is None:
-            continue
+
+@nav2.mcp("robonix/service/navigation/cancel")
+def cancel(req: CancelNavigation_Request) -> CancelNavigation_Response:
+    """Cancel an active navigation goal.
+
+    Empty ``goal_id`` cancels the currently active goal. Idempotent: if
+    there is no active goal, returns ``accepted=false`` with an explanatory
+    message.
+    """
+    if not _initialized:
+        return CancelNavigation_Response(
+            accepted=False, status_message="nav2 not initialized",
+        )
+    gid = (req.goal_id or "").strip()
+    if not gid:
+        gid = _last_goal_id
+    with _state_lock:
+        gh = _goal_handles.get(gid)
+    if gh is None:
+        return CancelNavigation_Response(
+            accepted=False, status_message="no active goal handle",
+        )
+    try:
+        gh.cancel_goal_async()  # type: ignore[union-attr]
+    except Exception as e:  # noqa: BLE001
+        return CancelNavigation_Response(
+            accepted=False, status_message=f"cancel failed: {e}",
+        )
+    return CancelNavigation_Response(
+        accepted=True, status_message="cancel_requested",
+    )
+
+
+# ── lifecycle ────────────────────────────────────────────────────────────────
+@nav2.on_init
+def init(cfg):
+    """Driver(CMD_INIT). Resolve atlas deps, spawn nav2, wait for action."""
+    global _initialized
+    with _state_lock:
+        if _initialized:
+            return Ok()
+
+    cfg = cfg or {}
+    if isinstance(cfg, str):
         try:
-            _atlas_stub.Heartbeat(pb.HeartbeatRequest(capability_id=_cap_id))
-        except Exception as e:  # noqa: BLE001
-            log.debug("heartbeat: %s", e)
+            cfg = json.loads(cfg) if cfg else {}
+        except json.JSONDecodeError as e:
+            return Err(f"bad config_json: {e}")
+
+    action_wait = float(cfg.get("action_wait_s", 45.0))
+
+    remap_args, missing = _build_remap_args(cfg)
+    if missing:
+        return Deferred(
+            f"missing required atlas contracts: {missing} "
+            "(awaiting upstream provider)"
+        )
+
+    try:
+        _spawn_nav2(cfg, remap_args)
+    except Exception as e:  # noqa: BLE001
+        return Err(f"spawn nav2 failed: {e}")
+
+    _start_ros2_thread()
+
+    if not _wait_for_action(action_wait):
+        # Don't kill nav2 — degraded state is still useful (operator can
+        # investigate). Mark failure but leave the process up.
+        return Err(
+            f"navigate_to_pose action server did not come up "
+            f"within {action_wait:.1f}s"
+        )
+
+    with _state_lock:
+        _initialized = True
+    log.info("init complete: nav2 alive, navigate/status/cancel MCP-exposed")
+    return Ok()
+
 
 def _on_signal(signum, _frame):
     log.info("signal %d — shutting down", signum)
     _kill_nav2()
-    sys.exit(0)
+    raise SystemExit(0)
 
-def main() -> None:
-    global _atlas_stub, _cap_id
-    atlas_addr = os.environ.get("ROBONIX_ATLAS", "127.0.0.1:50051")
-    requested_port = int(os.environ.get("NAV2_DRIVER_PORT", "50235"))
-    _cap_id = os.environ.get(
-        "ROBONIX_CAPABILITY_ID", "nav2"
-    )
-    log.info(
-        "main starting: cap_id=%s, atlas=%s, requested_driver_port=%d, pid=%d",
-        _cap_id,
-        atlas_addr,
-        requested_port,
-        os.getpid(),
-    )
 
+def main() -> int:
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
-
-    # _start_grpc returns the port grpc ACTUALLY bound to (may differ from
-    # requested_port if e.g. another process owns it; falls back to :0 in
-    # that case). Use that to declare to atlas, NEVER the requested port —
-    # otherwise rbnx will see the wrong endpoint and fail Driver(CMD_INIT/
-    # CMD_ACTIVATE) with "Connection refused".
-    driver_port = _start_grpc(requested_port)
-    # Persist for the post-INIT navigate/status/cancel DeclareInterfaces
-    # (they currently re-read NAV2_DRIVER_PORT env at line 472 — keep
-    # them in sync by overriding it here so they pick up the actually-bound
-    # port after a fallback. Cheap, idempotent.).
-    os.environ["NAV2_DRIVER_PORT"] = str(driver_port)
-
-    channel = grpc.insecure_channel(atlas_addr)
-    _atlas_stub = pb_grpc.AtlasStub(channel)
-    pkg_dir = os.environ.get("ROBONIX_PKG_HOST_DIR", "")
-    md_path = f"{pkg_dir}/CAPABILITY.md" if pkg_dir else ""
     try:
-        _atlas_stub.RegisterCapability(pb.RegisterCapabilityRequest(
-            capability_id=_cap_id,
-            namespace="robonix/service/navigation",
-            capability_md_path=md_path,
-        ))
-        # Declare ONLY the driver gRPC iface up front. navigate / status /
-        # cancel go on atlas after Init succeeds.
-        _atlas_stub.DeclareInterface(pb.DeclareInterfaceRequest(
-            capability_id=_cap_id,
-            contract_id="robonix/service/navigation/driver",
-            transport=pb.TRANSPORT_GRPC,
-            endpoint=f"127.0.0.1:{driver_port}",
-            params=pb.TransportParams(grpc=pb.GrpcParams(
-                proto_file="robonix_contracts.proto",
-                service_name="ServiceNavigationDriver",
-                method="Driver",
-            )),
-        ))
-        log.info("registered cap %s, driver iface on :%d (awaiting INIT)",
-                 _cap_id, driver_port)
-    except grpc.RpcError as e:
-        if e.code() == grpc.StatusCode.ALREADY_EXISTS:
-            log.info("cap %s already registered (re-deploy); ok", _cap_id)
-        else:
-            log.warning("atlas registration failed: %s", e)
-
-    threading.Thread(target=_heartbeat_loop, daemon=True).start()
-    log.info("ready — awaiting Driver(CMD_INIT)")
-    try:
-        while True:
-            time.sleep(60.0)
-    except KeyboardInterrupt:
-        pass
+        nav2.run()
     finally:
         _kill_nav2()
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    import sys
+    sys.exit(main())

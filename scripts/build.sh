@@ -23,7 +23,7 @@ if ! ros2 pkg list 2>/dev/null | grep -q "^nav2_bringup$"; then
     echo "                       sudo apt install ros-humble-nav2-bringup ros-humble-navigation2"
 fi
 
-FLAGS=(--out-dir "$PKG/rbnx-build/codegen")
+FLAGS=(--out-dir "$PKG/rbnx-build/codegen" --mcp)
 [[ "$CLEAN" == "1" ]] && FLAGS+=(--clean)
 echo "[nav2_wrapper/build] rbnx codegen ${FLAGS[*]}"
 rbnx codegen -p "$PKG" "${FLAGS[@]}"
