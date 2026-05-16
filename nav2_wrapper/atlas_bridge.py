@@ -44,7 +44,6 @@ logging.basicConfig(level=os.environ.get("NAV2_LOG_LEVEL", "INFO"),
                     format="[nav2_wrapper] %(message)s")
 log = logging.getLogger("nav2_wrapper")
 
-
 def _ensure_proto_gen() -> None:
     d = Path(__file__).resolve().parent
     while d.parent != d:
@@ -53,7 +52,6 @@ def _ensure_proto_gen() -> None:
             sys.path.insert(0, str(pg))
             return
         d = d.parent
-
 
 _ensure_proto_gen()
 
@@ -69,13 +67,13 @@ CMD_ACTIVATE = 1
 CMD_DEACTIVATE = 2
 CMD_SHUTDOWN = 3
 
-
 # ── shared state ─────────────────────────────────────────────────────────────
 _state_lock = threading.Lock()
 _atlas_stub: pb_grpc.AtlasStub | None = None
 _cap_id: str = ""
 _pkg_root: Path = Path(__file__).resolve().parent.parent
 _nav2_proc: subprocess.Popen | None = None
+_grpc_server: grpc.Server | None = None   # prevent GC of the gRPC server
 _initialized = False
 
 # ROS2 client state (initialized inside Driver.Init after nav2 is alive)
@@ -89,7 +87,6 @@ _nav_queue: "queue.Queue[tuple[str, dict]]" = queue.Queue()
 _goal_states: dict[str, dict] = {}
 _goal_handles: dict[str, object] = {}
 
-
 def _import_ros2() -> None:
     global _NavigateToPose, _PoseStamped, _GoalStatus
     from geometry_msgs.msg import PoseStamped as RosPoseStamped  # type: ignore
@@ -101,7 +98,6 @@ def _import_ros2() -> None:
         _GoalStatus = None
     _PoseStamped = RosPoseStamped
     _NavigateToPose = NavigateToPose
-
 
 # ── atlas-driven dependency discovery ────────────────────────────────────────
 # nav2 needs a few upstream data streams. We DO NOT hardcode which package
@@ -130,7 +126,6 @@ _OPTIONAL_DEPS: tuple[tuple[str, str, str], ...] = (
     ("scan_cloud",  "robonix/primitive/lidar/lidar3d", "/scanner/cloud"),
 )
 
-
 def _resolve_dep(stub, contract_id: str) -> str | None:
     """Query atlas for a contract over ROS2; return endpoint or None."""
     try:
@@ -157,7 +152,6 @@ def _resolve_dep(stub, contract_id: str) -> str | None:
             except grpc.RpcError as e:
                 log.warning("connect %s failed: %s", contract_id, e)
     return None
-
 
 def _build_remap_args(cfg: dict) -> tuple[list[str], list[str]]:
     """Return (remap_args, missing_required).
@@ -196,7 +190,6 @@ def _build_remap_args(cfg: dict) -> tuple[list[str], list[str]]:
 
     return remap_args, missing
 
-
 # ── nav2 subprocess management ───────────────────────────────────────────────
 def _resolve_params_file(cfg: dict) -> str:
     explicit = cfg.get("params_file")
@@ -220,7 +213,6 @@ def _resolve_params_file(cfg: dict) -> str:
     if not p.is_file():
         raise FileNotFoundError(f"params file for profile {profile!r} missing: {p}")
     return str(p)
-
 
 def _spawn_nav2(cfg: dict, remap_args: list[str]) -> None:
     global _nav2_proc
@@ -247,7 +239,6 @@ def _spawn_nav2(cfg: dict, remap_args: list[str]) -> None:
         args, stdout=log_fh, stderr=log_fh, start_new_session=True,
     )
 
-
 def _kill_nav2() -> None:
     p = _nav2_proc
     if p is None or p.poll() is not None:
@@ -263,7 +254,6 @@ def _kill_nav2() -> None:
             os.killpg(os.getpgid(p.pid), signal.SIGKILL)
         except ProcessLookupError:
             pass
-
 
 # ── ROS2 wiring (started after nav2 is alive) ────────────────────────────────
 def _start_ros2_thread() -> None:
@@ -292,7 +282,6 @@ def _start_ros2_thread() -> None:
                 _dispatch_goal(node, gid, payload)
     threading.Thread(target=_run, daemon=True).start()
 
-
 def _wait_for_action(timeout_s: float) -> bool:
     """Block until `navigate_to_pose` is ready (post-Init nav2 lifecycle bring-up)."""
     global _nav_action_ready
@@ -304,7 +293,6 @@ def _wait_for_action(timeout_s: float) -> bool:
         time.sleep(0.5)
     return False
 
-
 def _make_pose(node, frame_id: str, x: float, y: float, yaw: float):
     g = _PoseStamped()
     g.header.frame_id = frame_id
@@ -315,7 +303,6 @@ def _make_pose(node, frame_id: str, x: float, y: float, yaw: float):
     g.pose.orientation.z = math.sin(yaw / 2.0)
     g.pose.orientation.w = math.cos(yaw / 2.0)
     return g
-
 
 def _goal_status_name(status: int) -> str:
     if _GoalStatus is None:
@@ -331,7 +318,6 @@ def _goal_status_name(status: int) -> str:
         int(g.STATUS_ABORTED):  "ABORTED",
     }
     return m.get(int(status), str(int(status)))
-
 
 def _goal_response_cb(fut, gid: str):
     try:
@@ -353,7 +339,6 @@ def _goal_response_cb(fut, gid: str):
     res_fut = gh.get_result_async()
     res_fut.add_done_callback(lambda f: _result_cb(f, gid))
 
-
 def _result_cb(fut, gid: str):
     try:
         res = fut.result()
@@ -367,7 +352,6 @@ def _result_cb(fut, gid: str):
             _goal_states[gid] = {"status": "FAILED", "accepted": True,
                                  "terminal": True, "error": str(e)}
             _goal_handles.pop(gid, None)
-
 
 def _dispatch_goal(node, gid: str, payload: dict):
     pose = _make_pose(node, payload["frame_id"], payload["x"], payload["y"], payload["yaw"])
@@ -383,7 +367,6 @@ def _dispatch_goal(node, gid: str, payload: dict):
     send_future.add_done_callback(lambda f, g=gid: _goal_response_cb(f, g))
     with _state_lock:
         _goal_states[gid] = {"status": "SENT", "accepted": False, "terminal": False}
-
 
 # ── data-interface declaration helpers ───────────────────────────────────────
 def _decl_grpc(contract_id: str, port: int, service_name: str, method: str) -> None:
@@ -401,9 +384,8 @@ def _decl_grpc(contract_id: str, port: int, service_name: str, method: str) -> N
         )),
     ))
 
-
 # ── gRPC servicers ───────────────────────────────────────────────────────────
-class _NavDriverServicer(contracts_grpc.ServiceNavigationDriverServicer):
+class _NavDriverServicer(contracts_grpc.RobonixServiceNavigationDriverServicer):
     def Driver(self, request, context):
         cmd = int(request.command)
         if cmd == CMD_INIT:
@@ -487,12 +469,10 @@ class _NavDriverServicer(contracts_grpc.ServiceNavigationDriverServicer):
         log.info("init complete: nav2 alive, navigate/status/cancel declared")
         return lifecycle_pb2.Driver_Response(ok=True, state="inactive", error="")
 
-
 def _quat_to_yaw(z: float, w: float) -> float:
     return 2.0 * math.atan2(z, w)
 
-
-class _NavigateServicer(contracts_grpc.ServiceNavigationNavigateServicer):
+class _NavigateServicer(contracts_grpc.RobonixServiceNavigationNavigateServicer):
     def Navigate(self, request, context):
         if _ros_node is None:
             return navigation_pb2.Navigate_Response(
@@ -517,8 +497,7 @@ class _NavigateServicer(contracts_grpc.ServiceNavigationNavigateServicer):
             status_message=json.dumps({"goal_id": gid, "status": "queued"}),
         )
 
-
-class _StatusServicer(contracts_grpc.ServiceNavigationStatusServicer):
+class _StatusServicer(contracts_grpc.RobonixServiceNavigationStatusServicer):
     def GetNavigationStatus(self, request, context):
         gid = request.goal_id
         with _state_lock:
@@ -533,8 +512,7 @@ class _StatusServicer(contracts_grpc.ServiceNavigationStatusServicer):
             terminal=bool(st.get("terminal", False)),
         )
 
-
-class _CancelServicer(contracts_grpc.ServiceNavigationCancelServicer):
+class _CancelServicer(contracts_grpc.RobonixServiceNavigationCancelServicer):
     def CancelNavigation(self, request, context):
         gid = request.goal_id
         with _state_lock:
@@ -553,21 +531,61 @@ class _CancelServicer(contracts_grpc.ServiceNavigationCancelServicer):
             accepted=True, message="cancel_requested",
         )
 
+def _start_grpc(requested_port: int) -> int:
+    """Start the gRPC server. Returns the port grpc actually bound to.
 
-def _start_grpc(port: int) -> None:
+    grpc.add_insecure_port() returns 0 on bind failure (port already in use,
+    AF_INET6 disabled, etc.) and does NOT raise. The earlier code logged
+    "serving on 0.0.0.0:<requested>" unconditionally and then declared the
+    requested port to atlas — when the bind silently failed atlas was told
+    a port nobody was listening on, and Driver(CMD_INIT)/(CMD_ACTIVATE) hit
+    `Connection refused` with no diagnostic. Always log the actual bound
+    port, fall back to OS-assigned :0 on bind failure, and abort hard if
+    even :0 fails (something is very wrong with the network stack).
+    """
+    global _grpc_server
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
-    contracts_grpc.add_ServiceNavigationDriverServicer_to_server(
+    contracts_grpc.add_RobonixServiceNavigationDriverServicer_to_server(
         _NavDriverServicer(), server)
-    contracts_grpc.add_ServiceNavigationNavigateServicer_to_server(
+    contracts_grpc.add_RobonixServiceNavigationNavigateServicer_to_server(
         _NavigateServicer(), server)
-    contracts_grpc.add_ServiceNavigationStatusServicer_to_server(
+    contracts_grpc.add_RobonixServiceNavigationStatusServicer_to_server(
         _StatusServicer(), server)
-    contracts_grpc.add_ServiceNavigationCancelServicer_to_server(
+    contracts_grpc.add_RobonixServiceNavigationCancelServicer_to_server(
         _CancelServicer(), server)
-    server.add_insecure_port(f"[::]:{port}")
-    server.start()
-    log.info("Navigation gRPC serving on 0.0.0.0:%d", port)
 
+    # Try binding on both IPv4 and IPv6 to ensure the port is reachable
+    # via 127.0.0.1 (which atlas/rbnx uses). [::] alone may only listen
+    # on IPv6 on kernels with net.ipv6.bindv6only=1.
+    bound = server.add_insecure_port(f"0.0.0.0:{requested_port}")
+    log.info("add_insecure_port(0.0.0.0:%d) returned %d", requested_port, bound)
+    if bound == 0:
+        log.warning(
+            "bind to 0.0.0.0:%d FAILED (port busy?). "
+            "Retrying with 0.0.0.0:0 (OS-assigned port).",
+            requested_port,
+        )
+        bound = server.add_insecure_port("0.0.0.0:0")
+        log.info("add_insecure_port(0.0.0.0:0) returned %d", bound)
+        if bound == 0:
+            log.error(
+                "add_insecure_port(0.0.0.0:0) also returned 0 — gRPC cannot bind "
+                "ANY port. Aborting; rbnx will see this process exit and report "
+                "spawn failure cleanly instead of timing out on a phantom endpoint."
+            )
+            sys.exit(2)
+
+    server.start()
+    # Keep a global reference so the server (and its listening socket) are
+    # never garbage-collected while the process is alive.
+    _grpc_server = server
+    log.info(
+        "Navigation gRPC serving on 0.0.0.0:%d (requested %d), server=%r",
+        bound,
+        requested_port,
+        server,
+    )
+    return bound
 
 def _heartbeat_loop() -> None:
     while True:
@@ -579,25 +597,40 @@ def _heartbeat_loop() -> None:
         except Exception as e:  # noqa: BLE001
             log.debug("heartbeat: %s", e)
 
-
 def _on_signal(signum, _frame):
     log.info("signal %d — shutting down", signum)
     _kill_nav2()
     sys.exit(0)
 
-
 def main() -> None:
     global _atlas_stub, _cap_id
     atlas_addr = os.environ.get("ROBONIX_ATLAS", "127.0.0.1:50051")
-    driver_port = int(os.environ.get("NAV2_DRIVER_PORT", "50235"))
+    requested_port = int(os.environ.get("NAV2_DRIVER_PORT", "50235"))
     _cap_id = os.environ.get(
-        "ROBONIX_CAPABILITY_ID", "com.robonix.service.nav2"
+        "ROBONIX_CAPABILITY_ID", "nav2"
+    )
+    log.info(
+        "main starting: cap_id=%s, atlas=%s, requested_driver_port=%d, pid=%d",
+        _cap_id,
+        atlas_addr,
+        requested_port,
+        os.getpid(),
     )
 
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
 
-    _start_grpc(driver_port)
+    # _start_grpc returns the port grpc ACTUALLY bound to (may differ from
+    # requested_port if e.g. another process owns it; falls back to :0 in
+    # that case). Use that to declare to atlas, NEVER the requested port —
+    # otherwise rbnx will see the wrong endpoint and fail Driver(CMD_INIT/
+    # CMD_ACTIVATE) with "Connection refused".
+    driver_port = _start_grpc(requested_port)
+    # Persist for the post-INIT navigate/status/cancel DeclareInterfaces
+    # (they currently re-read NAV2_DRIVER_PORT env at line 472 — keep
+    # them in sync by overriding it here so they pick up the actually-bound
+    # port after a fallback. Cheap, idempotent.).
+    os.environ["NAV2_DRIVER_PORT"] = str(driver_port)
 
     channel = grpc.insecure_channel(atlas_addr)
     _atlas_stub = pb_grpc.AtlasStub(channel)
@@ -639,7 +672,6 @@ def main() -> None:
         pass
     finally:
         _kill_nav2()
-
 
 if __name__ == "__main__":
     main()
